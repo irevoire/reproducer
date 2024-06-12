@@ -1,0 +1,13 @@
+[package]
+name = "reproducer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fake = { version = "2.9.2", features = ["derive", "random_color", "url-escape", "uuid", "time"] }
+meilisearch-sdk = "0.26.1"
+serde = { version = "1.0.203", features = ["derive"] }
+serde_json = "1.0.117"
+time = { version = "0.3.36", features = ["serde", "parsing", "rand", "macros", "serde-well-known"] }
+tokio = { version = "1.38.0", features = ["full"] }
+uuid = { version = "1.8.0", features = ["v4", "serde", "fast-rng"] }
