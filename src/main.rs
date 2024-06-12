@@ -71,34 +71,39 @@ async fn main() {
         "With these settings:\n{}",
         serde_json::to_string_pretty(&Person::generate_settings()).unwrap()
     );
+    let send_settings = std::env::args().nth(1).is_some();
 
     let client = Client::new("http://localhost:7700", Option::<String>::None).unwrap();
+
+    let (mut last, mut last_finished) = last_task(&client).await.unwrap();
 
     println!("Making all the indexes...");
     for index_uid in 0..8000 {
         let index = client.index(index_uid.to_string());
-        tokio::task::spawn(handle_index(index));
+        tokio::task::spawn(handle_index(index, send_settings));
     }
 
-    let (mut last, mut last_finished) = last_task(&client).await;
-
     loop {
-        let (current, current_finished) = last_task(&client).await;
-
-        println!("Enqueued {} new tasks", current - last);
-        println!("Processed {} new tasks", current_finished - last_finished);
-        last = current;
-        last_finished = current_finished;
         tokio::time::sleep(Duration::from_secs(1)).await;
+        match last_task(&client).await {
+            Ok((current, current_finished)) => {
+                println!("Enqueued {} new tasks", current - last);
+                println!("Processed {} new tasks", current_finished - last_finished);
+                last = current;
+                last_finished = current_finished;
+            }
+            Err(e) => {
+                println!("ERROR: {e}");
+            }
+        }
     }
 }
 
-async fn last_task(client: &Client) -> (u32, u32) {
+async fn last_task(client: &Client) -> Result<(u32, u32), meilisearch_sdk::errors::Error> {
     let last = TasksSearchQuery::new(client)
         .with_limit(1)
         .execute()
-        .await
-        .unwrap()
+        .await?
         .results
         .first()
         .map_or(0, |task| task.get_uid());
@@ -106,33 +111,45 @@ async fn last_task(client: &Client) -> (u32, u32) {
         .with_limit(1)
         .with_statuses(["succeeded", "failed", "canceled"])
         .execute()
-        .await
-        .unwrap()
+        .await?
         .results
         .first()
         .map_or(0, |task| task.get_uid());
 
-    (last, last_finished)
+    Ok((last, last_finished))
 }
 
-async fn handle_index(index: Index) {
+async fn handle_index(index: Index, settings: bool) {
     // To reduce the number of requests at startup we introduce a random delay before the first request
-    let delay: u64 = (1..30).fake();
-    tokio::time::sleep(Duration::from_secs(delay)).await;
-    assert!(index
-        .set_settings(&Person::generate_settings())
-        .await
-        .unwrap()
-        .wait_for_completion(&index.client, None, Some(Duration::MAX))
-        .await
-        .unwrap()
-        .is_success());
+    if settings {
+        loop {
+            let delay: u64 = (1..30).fake();
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            match send_settings(&index).await {
+                Ok(()) => break,
+                Err(e) => println!("ERROR WHILE SENDING SETTINGS: {e}"),
+            }
+        }
+    }
 
     loop {
         let documents: Vec<Person> = fake::vec![Person; 50..1000];
-        index.add_documents(&documents, Some("id")).await.unwrap();
+        let _ = index.add_documents(&documents, Some("id")).await;
 
         let delay: u64 = (1..30).fake();
         tokio::time::sleep(Duration::from_secs(delay)).await;
+    }
+}
+
+async fn send_settings(index: &Index) -> Result<(), meilisearch_sdk::errors::Error> {
+    let ret = index
+        .set_settings(&Person::generate_settings())
+        .await?
+        .wait_for_completion(&index.client, None, Some(Duration::MAX))
+        .await?;
+    if ret.is_failure() {
+        Err(ret.unwrap_failure().into())
+    } else {
+        Ok(())
     }
 }
