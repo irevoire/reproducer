@@ -66,7 +66,7 @@ struct Geo {
 
 static NB_INDEXES_READY: AtomicUsize = AtomicUsize::new(0);
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() {
     println!(
         "Sending this kind of documents:\n{}",
