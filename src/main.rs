@@ -77,29 +77,29 @@ async fn main() {
         serde_json::to_string_pretty(&Person::generate_settings()).unwrap()
     );
     let send_settings = std::env::args().nth(1).is_some();
-    if send_settings {
+    if !send_settings {
         println!("Skipping the initialization of the indexes");
     }
 
     let client = Client::new("http://localhost:7700", Option::<String>::None).unwrap();
 
+    let channel_capacity = 10;
+    let (sender, receiver) = broadcast::channel(channel_capacity);
+    // Fill the broadcast channel
+    for _ in 0..channel_capacity {
+        let documents: Vec<Person> = fake::vec![Person; 50..100];
+        sender.send(Arc::new(documents)).unwrap();
+    }
+
     let (mut last, mut last_finished) = last_task(&client).await.unwrap();
 
     let nb_indexes = 8000;
-    let channel_capacity = 10;
-    let (sender, receiver) = broadcast::channel(channel_capacity);
     println!("Making all the indexes...");
     for index_uid in 0..nb_indexes {
         let index = client.index(index_uid.to_string());
         tokio::task::spawn(handle_index(index, send_settings, receiver.resubscribe()));
     }
     drop(receiver);
-
-    // Fill the broadcast channel
-    for _ in 0..channel_capacity {
-        let documents: Vec<Person> = fake::vec![Person; 50..1000];
-        sender.send(Arc::new(documents)).unwrap();
-    }
 
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
