@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use fake::faker::address::fr_fr::{Latitude, Longitude};
 use fake::faker::administrative::fr_fr::HealthInsuranceCode;
 use fake::faker::automotive::fr_fr::LicencePlate;
@@ -11,13 +11,22 @@ use fake::faker::name::fr_fr::Name;
 use fake::faker::time::fr_fr::Date;
 use fake::uuid::UUIDv4;
 use fake::{Dummy, Fake, Faker};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use meilisearch_sdk::client::Client;
 use meilisearch_sdk::documents::IndexConfig;
 use meilisearch_sdk::indexes::Index;
 use meilisearch_sdk::tasks::TasksSearchQuery;
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+use mimalloc::MiMalloc;
+
+// there is a lot of fragmentation and it ends up acting like a memory leak
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Serialize, Deserialize, IndexConfig, Dummy, Debug)]
 struct Person {
@@ -27,7 +36,7 @@ struct Person {
     #[dummy(faker = "Name()")]
     name: String,
     #[index_config(displayed, searchable)]
-    #[dummy(faker = "Paragraph(50..500)")]
+    #[dummy(faker = "Paragraph(5..50)")]
     description: String,
     #[index_config(filterable, sortable, displayed)]
     #[dummy(faker = "Date()")]
@@ -66,6 +75,23 @@ struct Geo {
 
 static NB_INDEXES_READY: AtomicUsize = AtomicUsize::new(0);
 
+struct Persons;
+
+impl Serialize for Persons {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let nb: usize = (50..1000).fake();
+        let mut seq = serializer.serialize_seq(Some(nb))?;
+        for _ in 0..nb {
+            let person = Faker.fake::<Person>();
+            seq.serialize_element(&person)?;
+        }
+        seq.end()
+    }
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     println!(
@@ -87,8 +113,7 @@ async fn main() {
     let (sender, receiver) = broadcast::channel(channel_capacity);
     // Fill the broadcast channel
     for _ in 0..channel_capacity {
-        let documents: Vec<Person> = fake::vec![Person; 50..100];
-        sender.send(Arc::new(documents)).unwrap();
+        sender.send(make_documents()).unwrap();
     }
 
     let (mut last, mut last_finished) = last_task(&client).await.unwrap();
@@ -120,8 +145,7 @@ async fn main() {
                 println!("ERROR: {e}");
             }
         }
-        let documents: Vec<Person> = fake::vec![Person; 50..1000];
-        sender.send(Arc::new(documents)).unwrap();
+        sender.send(make_documents()).unwrap();
     }
 }
 
@@ -145,15 +169,11 @@ async fn last_task(client: &Client) -> Result<(u32, u32), meilisearch_sdk::error
     Ok((last, last_finished))
 }
 
-async fn handle_index(
-    index: Index,
-    settings: bool,
-    mut receiver: broadcast::Receiver<Arc<Vec<Person>>>,
-) {
+async fn handle_index(index: Index, settings: bool, mut receiver: broadcast::Receiver<Bytes>) {
     // To reduce the number of requests at startup we introduce a random delay before the first request
     if settings {
         loop {
-            let delay: u64 = (1..30).fake();
+            let delay: u64 = (100..300).fake();
             tokio::time::sleep(Duration::from_secs(delay)).await;
             match send_settings(&index).await {
                 Ok(()) => break,
@@ -164,23 +184,37 @@ async fn handle_index(
 
     NB_INDEXES_READY.fetch_add(1, Ordering::Relaxed);
 
+    let client = reqwest::Client::new();
+    let route = format!("http://localhost:7700/indexes/{}/documents", index.uid);
     loop {
         match receiver.recv().await {
             Ok(documents) => {
-                let _ = index.add_documents(&documents, Some("id")).await;
+                match client
+                    .put(&route)
+                    .body(documents)
+                    .header("Content-Type", "application/json")
+                    .header("Content-Encoding", "gzip")
+                    .send()
+                    .await
+                {
+                    Ok(_) => (),
+                    Err(e) => {
+                        println!("ERROR while sending documents: {e}");
+                    }
+                }
             }
             // We don't care about the lost message
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => break,
         }
 
-        let delay: u64 = (30..60).fake();
+        let delay: u64 = (200..400).fake();
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
 
 async fn send_settings(index: &Index) -> Result<(), meilisearch_sdk::errors::Error> {
-    let delay: u64 = (30..60).fake();
+    let delay: u64 = (60..120).fake();
     let ret = index
         .set_settings(&Person::generate_settings())
         .await?
@@ -196,4 +230,12 @@ async fn send_settings(index: &Index) -> Result<(), meilisearch_sdk::errors::Err
     } else {
         Ok(())
     }
+}
+
+fn make_documents() -> Bytes {
+    let writer = Vec::new();
+    let mut writer = GzEncoder::new(writer, Compression::default());
+    serde_json::to_writer(&mut writer, &Persons).unwrap();
+    let writer = writer.finish().unwrap();
+    Bytes::from(writer)
 }
