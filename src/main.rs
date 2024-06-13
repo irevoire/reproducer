@@ -86,7 +86,7 @@ async fn main() {
     let (mut last, mut last_finished) = last_task(&client).await.unwrap();
 
     let nb_indexes = 8000;
-    let channel_capacity = 1000;
+    let channel_capacity = 10;
     let (sender, receiver) = broadcast::channel(channel_capacity);
     println!("Making all the indexes...");
     for index_uid in 0..nb_indexes {
