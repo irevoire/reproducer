@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use fake::faker::address::fr_fr::{Latitude, Longitude};
@@ -14,6 +16,7 @@ use meilisearch_sdk::documents::IndexConfig;
 use meilisearch_sdk::indexes::Index;
 use meilisearch_sdk::tasks::TasksSearchQuery;
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, IndexConfig, Dummy, Debug)]
@@ -61,6 +64,8 @@ struct Geo {
     lng: f64,
 }
 
+static NB_INDEXES_READY: AtomicUsize = AtomicUsize::new(0);
+
 #[tokio::main]
 async fn main() {
     println!(
@@ -72,23 +77,42 @@ async fn main() {
         serde_json::to_string_pretty(&Person::generate_settings()).unwrap()
     );
     let send_settings = std::env::args().nth(1).is_some();
+    if send_settings {
+        println!("Skipping the initialization of the indexes");
+    }
 
     let client = Client::new("http://localhost:7700", Option::<String>::None).unwrap();
 
     let (mut last, mut last_finished) = last_task(&client).await.unwrap();
 
+    let nb_indexes = 8000;
+    let channel_capacity = 1000;
+    let (sender, receiver) = broadcast::channel(channel_capacity);
     println!("Making all the indexes...");
-    for index_uid in 0..8000 {
+    for index_uid in 0..nb_indexes {
         let index = client.index(index_uid.to_string());
-        tokio::task::spawn(handle_index(index, send_settings));
+        tokio::task::spawn(handle_index(index, send_settings, receiver.resubscribe()));
+    }
+    drop(receiver);
+
+    // Fill the broadcast channel
+    for _ in 0..channel_capacity {
+        let documents: Vec<Person> = fake::vec![Person; 50..1000];
+        sender.send(Arc::new(documents)).unwrap();
     }
 
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         match last_task(&client).await {
             Ok((current, current_finished)) => {
+                println!(
+                    "Indexes ready to send: {}/{}",
+                    NB_INDEXES_READY.load(Ordering::Relaxed),
+                    nb_indexes
+                );
                 println!("Enqueued {} new tasks", current - last);
                 println!("Processed {} new tasks", current_finished - last_finished);
+                println!();
                 last = current;
                 last_finished = current_finished;
             }
@@ -96,6 +120,8 @@ async fn main() {
                 println!("ERROR: {e}");
             }
         }
+        let documents: Vec<Person> = fake::vec![Person; 50..1000];
+        sender.send(Arc::new(documents)).unwrap();
     }
 }
 
@@ -119,7 +145,11 @@ async fn last_task(client: &Client) -> Result<(u32, u32), meilisearch_sdk::error
     Ok((last, last_finished))
 }
 
-async fn handle_index(index: Index, settings: bool) {
+async fn handle_index(
+    index: Index,
+    settings: bool,
+    mut receiver: broadcast::Receiver<Arc<Vec<Person>>>,
+) {
     // To reduce the number of requests at startup we introduce a random delay before the first request
     if settings {
         loop {
@@ -132,20 +162,34 @@ async fn handle_index(index: Index, settings: bool) {
         }
     }
 
-    loop {
-        let documents: Vec<Person> = fake::vec![Person; 50..1000];
-        let _ = index.add_documents(&documents, Some("id")).await;
+    NB_INDEXES_READY.fetch_add(1, Ordering::Relaxed);
 
-        let delay: u64 = (1..30).fake();
+    loop {
+        match receiver.recv().await {
+            Ok(documents) => {
+                let _ = index.add_documents(&documents, Some("id")).await;
+            }
+            // We don't care about the lost message
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+
+        let delay: u64 = (30..60).fake();
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
 }
 
 async fn send_settings(index: &Index) -> Result<(), meilisearch_sdk::errors::Error> {
+    let delay: u64 = (30..60).fake();
     let ret = index
         .set_settings(&Person::generate_settings())
         .await?
-        .wait_for_completion(&index.client, None, Some(Duration::MAX))
+        .wait_for_completion(
+            &index.client,
+            // If we poll too often we'll exhaust the available port quite fast
+            Some(Duration::from_secs(delay)),
+            Some(Duration::MAX),
+        )
         .await?;
     if ret.is_failure() {
         Err(ret.unwrap_failure().into())
