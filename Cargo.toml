@@ -9,7 +9,7 @@ fake = { version = "2.9.2", features = ["derive", "random_color", "url-escape", 
 flate2 = "1.0.30"
 meilisearch-sdk = "0.26.1"
 mimalloc = "0.1.42"
-reqwest = "0.12.4"
+reqwest = { version = "0.12.4", default-features = false }
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
 time = { version = "0.3.36", features = ["serde", "parsing", "rand", "macros", "serde-well-known"] }
